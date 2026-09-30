@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: humm-whatsapp-engine
+    env: docker
+    dockerfilePath: bot/Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: humm-sessions
+      mountPath: /app/sessions
+      sizeGB: 1
+    envVars:
+      - key: PORT
+        value: 3001
+      - key: NODE_ENV
+        value: production
+      - key: SESSION_DATA_PATH
+        value: /app/sessions
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false

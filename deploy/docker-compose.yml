@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  humm-bot:
+    build:
+      context: ../bot
+      dockerfile: Dockerfile
+    container_name: humm-whatsapp-engine
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - NODE_ENV=production
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - BOT_USER_ID=${BOT_USER_ID}
+      - SESSION_DATA_PATH=/app/sessions
+    volumes:
+      # Volume persistant obligatoire pour conserver la session WhatsApp après redémarrage
+      - humm_sessions:/app/sessions
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  humm_sessions:
+    name: humm_sessions_data
