@@ -6,7 +6,7 @@ import { whatsAppManager } from './whatsapp';
 const app = express();
 app.use(express.json());
 
-// 1. Point de contrôle santé (Healthcheck pour UptimeRobot, Railway, Render)
+// 1. Point de contrôle santé
 app.get('/health', (_req: Request, res: Response) => {
   const status = whatsAppManager.getStatus();
   res.json({
@@ -48,7 +48,56 @@ app.post('/api/action', async (req: Request, res: Response) => {
   }
 });
 
-// 3. Initialisation du moteur et synchronisation Supabase
+// 3. Demande de code de jumelage (Pairing Code)
+app.post('/api/pair', async (req: Request, res: Response) => {
+  const { phoneNumber } = req.body;
+  if (!phoneNumber) {
+    return res.status(400).json({ success: false, error: 'Numéro de téléphone requis.' });
+  }
+
+  try {
+    const code = await whatsAppManager.requestPairing(phoneNumber);
+    res.json({ success: true, code });
+  } catch (err: any) {
+    console.error('[API /api/pair] Erreur :', err);
+    res.status(500).json({ success: false, error: err.message || 'Échec de la génération du code.' });
+  }
+});
+
+let currentConfig: BotConfigRow | null = null;
+let isSubscribed = false;
+
+function bindConfig(botConfig: BotConfigRow) {
+  currentConfig = botConfig;
+  whatsAppManager.updateConfig(botConfig);
+
+  if (botConfig.bot_status === 'running' && !whatsAppManager.getStatus().isConnected) {
+    console.log('[HUMM] Configuration active, lancement du client WhatsApp...');
+    whatsAppManager.start();
+  }
+
+  if (!isSubscribed) {
+    isSubscribed = true;
+    console.log(`[Supabase Realtime] Abonnement aux changements pour ${botConfig.id}`);
+    
+    supabaseService.subscribeToConfig(botConfig.id, async (updated: BotConfigRow) => {
+      console.log(`[Supabase Realtime] Changement détecté : bot_status=${updated.bot_status}, whatsapp_status=${updated.whatsapp_status}`);
+      const prevStatus = currentConfig?.bot_status;
+      currentConfig = updated;
+      whatsAppManager.updateConfig(updated);
+
+      if (prevStatus !== 'running' && updated.bot_status === 'running') {
+        console.log('[HUMM] Ordre de démarrage reçu');
+        await whatsAppManager.start();
+      } else if (prevStatus === 'running' && updated.bot_status === 'stopped') {
+        console.log('[HUMM] Ordre de mise en pause reçu');
+        await whatsAppManager.stop();
+      }
+    });
+  }
+}
+
+// 4. Initialisation du moteur et boucle permanente de synchronisation
 async function main() {
   console.log('----------------------------------------------------');
   console.log('⚡ DÉMARRAGE DU MOTEUR WHATSAPP HUMM (AUTONOME 24/7)');
@@ -56,76 +105,55 @@ async function main() {
   
   validateConfig();
 
-  // Démarrage du serveur HTTP de surveillance
   app.listen(config.port, () => {
     console.log(`[HTTP] Serveur de contrôle à l'écoute sur le port ${config.port}`);
   });
 
   if (supabaseService.isReady) {
-    console.log('[Supabase] Initialisation de la synchronisation en temps réel...');
+    console.log('[Supabase] Initialisation de la synchronisation Supabase...');
     
-    // Récupération de la configuration existante
-    let botConfig = await supabaseService.getBotConfig();
-    
-    if (botConfig) {
-      console.log(`[Supabase] Configuration chargée pour l'utilisateur ${botConfig.user_id}`);
-      whatsAppManager.updateConfig(botConfig);
+    // Vérification continue (toutes les 3 secondes) pour garantir une réactivité immédiate
+    setInterval(async () => {
+      try {
+        const latest = await supabaseService.getBotConfig();
+        if (latest) {
+          if (!currentConfig) {
+            console.log(`[Supabase] Première configuration trouvée pour l'utilisateur ${latest.user_id}`);
+            bindConfig(latest);
+          } else {
+            // Détection des changements de statut même si WebSocket Realtime a un délai
+            const prevBotStatus = currentConfig.bot_status;
+            currentConfig = latest;
+            whatsAppManager.updateConfig(latest);
 
-      // Si le bot était marqué comme actif, relancer automatiquement la session
-      if (botConfig.bot_status === 'running') {
-        console.log('[HUMM] Le statut est "running", lancement de la connexion WhatsApp...');
-        await whatsAppManager.start();
-      }
-
-      // Écoute des ordres en provenance du Dashboard web via Realtime
-      supabaseService.subscribeToConfig(botConfig.id, async (updated: BotConfigRow) => {
-        console.log(`[Supabase Realtime] Mise à jour détectée : bot_status=${updated.bot_status}, destination=${updated.destination_chat}`);
-        
-        const previousStatus = botConfig?.bot_status;
-        botConfig = updated;
-        whatsAppManager.updateConfig(updated);
-
-        // Si l'utilisateur clique sur "Démarrer" dans le SaaS
-        if (previousStatus !== 'running' && updated.bot_status === 'running') {
-          console.log('[HUMM] Ordre de démarrage reçu depuis le Dashboard');
-          await whatsAppManager.start();
-        } 
-        // Si l'utilisateur clique sur "Mettre en pause"
-        else if (previousStatus === 'running' && updated.bot_status === 'stopped') {
-          console.log('[HUMM] Ordre de mise en pause reçu depuis le Dashboard');
-          await whatsAppManager.stop();
-        }
-      });
-    } else {
-      console.warn('[Supabase] Aucune configuration trouvée. En attente du premier utilisateur...');
-      // Vérification périodique si l'utilisateur s'inscrit
-      const pollInterval = setInterval(async () => {
-        const found = await supabaseService.getBotConfig();
-        if (found) {
-          clearInterval(pollInterval);
-          console.log(`[Supabase] Configuration trouvée : ${found.user_id}`);
-          whatsAppManager.updateConfig(found);
-          if (found.bot_status === 'running') {
-            await whatsAppManager.start();
+            if (prevBotStatus !== 'running' && latest.bot_status === 'running') {
+              console.log('[HUMM Sync] Passage à l\'état running détecté, démarrage de Baileys...');
+              await whatsAppManager.start();
+            } else if (prevBotStatus === 'running' && latest.bot_status === 'stopped') {
+              console.log('[HUMM Sync] Passage à l\'état stopped détecté, arrêt de Baileys...');
+              await whatsAppManager.stop();
+            }
           }
         }
-      }, 5000);
-    }
+      } catch (e) {
+        console.error('[Sync loop error] :', e);
+      }
+    }, 3000);
+
   } else {
-    console.warn('[HUMM] Mode autonome local sans Supabase. Démarrage direct de Baileys...');
+    console.warn('[HUMM] Mode local sans Supabase.');
     await whatsAppManager.start();
   }
 }
 
-// Gestion des signaux d'arrêt propres
 process.on('SIGINT', async () => {
-  console.log('\n[HUMM] Arrêt du processus (SIGINT)...');
+  console.log('\n[HUMM] Arrêt (SIGINT)...');
   await whatsAppManager.stop();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  console.log('\n[HUMM] Arrêt du conteneur (SIGTERM)...');
+  console.log('\n[HUMM] Arrêt (SIGTERM)...');
   await whatsAppManager.stop();
   process.exit(0);
 });
