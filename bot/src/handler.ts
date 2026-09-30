@@ -1,6 +1,7 @@
 import { WASocket, proto } from '@whiskeysockets/baileys';
 import { extractMediaFromQuoted } from './media';
 import { supabaseService, BotConfigRow } from './supabase';
+import { cacheMessage } from './whatsapp';
 
 // Système anti-doublon pour éviter les traitements répétés (ex: retries réseau)
 const processedMessageIds = new Map<string, number>();
@@ -32,7 +33,6 @@ export function formatDestinationJid(destination: string | null, selfJid?: strin
     return trimmed;
   }
 
-  // Nettoyage des caractères non numériques (espaces, +, tirets)
   const digitsOnly = trimmed.replace(/\D/g, '');
   if (digitsOnly.length > 5) {
     return `${digitsOnly}@s.whatsapp.net`;
@@ -53,7 +53,7 @@ export async function handleIncomingMessage(
     const msgId = message.key.id;
     if (!msgId) return;
 
-    // 1. Prévention des doubles traitements
+    // 1. Verrou anti-doublon immédiat pour éviter les exécutions concurrentes
     if (processedMessageIds.has(msgId)) {
       return;
     }
@@ -70,7 +70,7 @@ export async function handleIncomingMessage(
       return;
     }
 
-    // Enregistrement de l'ID pour éviter tout double traitement ultérieur
+    // Enregistrement immédiat pour bloquer tout doublon
     processedMessageIds.set(msgId, Date.now());
 
     // 4. Contrôle de sécurité : seule la personne connectée au compte peut déclencher .humm
@@ -79,7 +79,6 @@ export async function handleIncomingMessage(
     const myJid = sock.user?.id ? sock.user.id.split(':')[0] : '';
 
     if (!isFromMe && (!myJid || !sender.includes(myJid))) {
-      // Ignorer silencieusement si la commande ne provient pas du titulaire du compte
       return;
     }
 
@@ -90,7 +89,7 @@ export async function handleIncomingMessage(
     const quotedMessage = contextInfo?.quotedMessage;
 
     if (!quotedMessage) {
-      console.warn('[HUMM] Commande reçue sans message cité.');
+      console.warn('[HUMM] Commande .humm reçue sans message cité.');
       await supabaseService.logActivity(
         userId,
         'warn',
@@ -120,34 +119,37 @@ export async function handleIncomingMessage(
       await supabaseService.logActivity(
         userId,
         'error',
-        'Échec : aucun chat privé de destination n\'est configuré dans le tableau de bord.'
+        'Échec : aucun chat privé de destination configuré.'
       );
       return;
     }
 
     // 8. Envoi sécurisé et direct vers le chat privé désigné
     const captionNote = '🔒 *HUMM* — Contenu récupéré en toute discrétion';
+    let sentMsg: proto.WebMessageInfo | undefined;
 
     if (extractedMedia.type === 'image') {
-      await sock.sendMessage(destinationJid, {
+      sentMsg = await sock.sendMessage(destinationJid, {
         image: extractedMedia.buffer,
         mimetype: extractedMedia.mimetype,
         caption: extractedMedia.caption ? `${captionNote}\n\n${extractedMedia.caption}` : captionNote,
+        viewOnce: false, // Ne pas renvoyer en vue unique
       });
     } else if (extractedMedia.type === 'video') {
-      await sock.sendMessage(destinationJid, {
+      sentMsg = await sock.sendMessage(destinationJid, {
         video: extractedMedia.buffer,
         mimetype: extractedMedia.mimetype,
         caption: extractedMedia.caption ? `${captionNote}\n\n${extractedMedia.caption}` : captionNote,
+        viewOnce: false,
       });
     } else if (extractedMedia.type === 'audio') {
-      await sock.sendMessage(destinationJid, {
+      sentMsg = await sock.sendMessage(destinationJid, {
         audio: extractedMedia.buffer,
         mimetype: extractedMedia.mimetype,
         ptt: false,
       });
     } else if (extractedMedia.type === 'document') {
-      await sock.sendMessage(destinationJid, {
+      sentMsg = await sock.sendMessage(destinationJid, {
         document: extractedMedia.buffer,
         mimetype: extractedMedia.mimetype,
         fileName: extractedMedia.fileName || 'media_humm',
@@ -155,9 +157,12 @@ export async function handleIncomingMessage(
       });
     }
 
-    // 9. Confidentialité garantie :
-    // Aucun message n'est envoyé dans le chat d'origine.
-    // L'expéditeur initial ne reçoit rien et ne s'aperçoit de rien.
+    // Mise en cache immédiate du message envoyé pour que le téléphone puisse le déchiffrer
+    if (sentMsg?.key?.id && sentMsg.message) {
+      cacheMessage(sentMsg.key.id, sentMsg.message);
+    }
+
+    // 9. Confidentialité garantie : zéro fuite, l'expéditeur initial ne reçoit rien
     await supabaseService.logActivity(
       userId,
       'success',

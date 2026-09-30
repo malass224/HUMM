@@ -5,6 +5,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   Browsers,
+  proto,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -15,6 +16,18 @@ import { supabaseService, BotConfigRow } from './supabase';
 import { handleIncomingMessage } from './handler';
 
 const logger = pino({ level: 'silent' });
+
+// Cache mémoire des messages (indispensable pour que le téléphone puisse déchiffrer les messages envoyés)
+// Sans getMessage, WhatsApp affiche « En attente de ce message. Ceci pourrait prendre un moment. »
+const messageCache = new Map<string, proto.IMessage>();
+
+export function cacheMessage(id: string, message: proto.IMessage): void {
+  if (messageCache.size > 2000) {
+    const firstKey = messageCache.keys().next().value;
+    if (firstKey) messageCache.delete(firstKey);
+  }
+  messageCache.set(id, message);
+}
 
 export class WhatsAppManager {
   private sock: WASocket | null = null;
@@ -40,7 +53,7 @@ export class WhatsAppManager {
   }
 
   /**
-   * Attache les écouteurs d'événements au socket Baileys
+   * Configuration et attachement des écouteurs d'événements
    */
   private setupSocketEvents(saveCreds: () => Promise<void>): void {
     if (!this.sock) return;
@@ -50,7 +63,7 @@ export class WhatsAppManager {
     this.sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
-      // 1. Présentation du QR code pour scan (uniquement si pas en mode code de jumelage)
+      // 1. Présentation du QR code si pas en mode code de jumelage
       if (qr && !this.activePairingNumber) {
         console.log('[WhatsApp] Nouveau QR Code généré et prêt.');
         if (this.currentConfig) {
@@ -66,7 +79,7 @@ export class WhatsAppManager {
         }
       }
 
-      // 2. Connexion établie avec succès
+      // 2. Connexion établie
       if (connection === 'open') {
         console.log('[WhatsApp] Connexion WhatsApp établie avec succès !');
         this.isConnecting = false;
@@ -83,18 +96,18 @@ export class WhatsAppManager {
           await supabaseService.logActivity(
             this.currentConfig.user_id,
             'success',
-            'WhatsApp connecté avec succès ! Le bot HUMM est prêt.'
+            'WhatsApp connecté et synchronisé. Commande .humm active.'
           );
         }
       }
 
-      // 3. Déconnexion ou perte temporaire
+      // 3. Déconnexion ou coupure temporaire
       if (connection === 'close') {
         this.isConnecting = false;
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
-        console.warn(`[WhatsApp] Connexion fermée (statut : ${statusCode}). Reconnexion autorisée : ${shouldReconnect}`);
+        console.warn(`[WhatsApp] Connexion fermée (statut: ${statusCode}). Reconnexion: ${shouldReconnect}`);
 
         if (statusCode === DisconnectReason.loggedOut) {
           await this.clearSession();
@@ -125,24 +138,32 @@ export class WhatsAppManager {
       }
     });
 
-    // Écoute des messages pour la commande unique .humm
+    // Écoute des messages entrants
     this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
+        // Mise en cache immédiate pour répondre aux demandes de clés / retry du téléphone
+        if (msg.key.id && msg.message) {
+          cacheMessage(msg.key.id, msg.message);
+        }
+
         await handleIncomingMessage(this.sock!, msg, this.currentConfig);
       }
     });
   }
 
   /**
-   * Initialise et démarre la connexion WhatsApp (mode QR code)
+   * Démarre une instance unique et propre du client WhatsApp
    */
   public async start(): Promise<void> {
     if (this.isConnecting || (this.sock && this.sock.user)) {
-      console.log('[WhatsApp] Connexion déjà active ou en cours.');
+      console.log('[WhatsApp] Connexion déjà active ou en cours d\'établissement.');
       return;
     }
+
+    // Destruction préventive de tout socket antérieur pour éviter les conflits de clés E2EE (Bad MAC)
+    await this.cleanupPreviousSocket();
 
     this.isConnecting = true;
     this.activePairingNumber = null;
@@ -162,9 +183,17 @@ export class WhatsAppManager {
           creds: state.creds,
           keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
+        // Implémentation vitale de getMessage pour résoudre « En attente de ce message »
+        getMessage: async (key) => {
+          if (key.id && messageCache.has(key.id)) {
+            return messageCache.get(key.id);
+          }
+          return undefined;
+        },
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
-        markOnlineOnConnect: false,
+        markOnlineOnConnect: true, // Doit être true pour que le téléphone reçoive les clés E2EE
+        defaultQueryTimeoutMs: undefined,
       });
 
       this.setupSocketEvents(saveCreds);
@@ -177,7 +206,7 @@ export class WhatsAppManager {
   }
 
   /**
-   * Demande un code de jumelage WhatsApp (Pairing Code) à 8 caractères
+   * Demande de code de jumelage WhatsApp (Pairing Code) à 8 caractères
    */
   public async requestPairing(phoneNumber: string): Promise<string> {
     const cleanNumber = phoneNumber.replace(/\D/g, '');
@@ -185,10 +214,9 @@ export class WhatsAppManager {
       throw new Error('Numéro invalide. Fournissez l\'indicatif complet (ex: 224620000000 ou 33612345678)');
     }
 
-    console.log(`[WhatsApp] Initialisation de la demande de jumelage pour +${cleanNumber}...`);
+    console.log(`[WhatsApp] Demande de code de jumelage pour +${cleanNumber}...`);
 
-    // On coupe toute session existante non enregistrée pour générer un code propre
-    await this.stop();
+    await this.cleanupPreviousSocket();
     await this.clearSession();
 
     this.isConnecting = true;
@@ -207,22 +235,28 @@ export class WhatsAppManager {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
+      getMessage: async (key) => {
+        if (key.id && messageCache.has(key.id)) {
+          return messageCache.get(key.id);
+        }
+        return undefined;
+      },
       generateHighQualityLinkPreview: false,
       syncFullHistory: false,
-      markOnlineOnConnect: false,
+      markOnlineOnConnect: true,
+      defaultQueryTimeoutMs: undefined,
     });
 
     this.setupSocketEvents(saveCreds);
 
-    // Attente brève que la connexion WebSocket préliminaire soit établie
+    // Attente brève de l'initialisation de la liaison WebSocket
     await new Promise((resolve) => setTimeout(resolve, 3000));
 
     if (!this.sock.authState.creds.registered) {
       try {
         const rawCode = await this.sock.requestPairingCode(cleanNumber);
-        // Formate en blocs pour une lisibilité parfaite (ex: ABCD-1234)
         const formattedCode = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
-        console.log(`[WhatsApp] Code de jumelage obtenu avec succès : ${formattedCode}`);
+        console.log(`[WhatsApp] Code de jumelage obtenu : ${formattedCode}`);
 
         if (this.currentConfig) {
           await supabaseService.updateBotConfig(this.currentConfig.id, {
@@ -232,7 +266,7 @@ export class WhatsAppManager {
           await supabaseService.logActivity(
             this.currentConfig.user_id,
             'info',
-            `Code de jumelage généré : ${formattedCode}. Entrez ce code dans WhatsApp > Appareils connectés.`
+            `Code de jumelage généré : ${formattedCode}. Entrez-le dans WhatsApp > Appareils connectés.`
           );
         }
 
@@ -242,8 +276,33 @@ export class WhatsAppManager {
         throw err;
       }
     } else {
-      throw new Error('Ce compte est déjà enregistré et connecté.');
+      throw new Error('Ce compte est déjà enregistré.');
     }
+  }
+
+  private async cleanupPreviousSocket(): Promise<void> {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+
+    if (this.sock) {
+      try {
+        this.sock.ev.removeAllListeners('connection.update');
+        this.sock.ev.removeAllListeners('creds.update');
+        this.sock.ev.removeAllListeners('messages.upsert');
+        // @ts-ignore
+        if (this.sock.ws) {
+          // @ts-ignore
+          this.sock.ws.terminate?.();
+          // @ts-ignore
+          this.sock.ws.close?.();
+        }
+        this.sock.end(undefined);
+      } catch {}
+      this.sock = null;
+    }
+    this.isConnecting = false;
   }
 
   private scheduleReconnect(): void {
@@ -257,31 +316,19 @@ export class WhatsAppManager {
     }
 
     this.reconnectAttempts++;
-    const delay = Math.min(3000 * Math.pow(1.5, this.reconnectAttempts), 30000);
-    console.log(`[WhatsApp] Tentative de reconnexion dans ${Math.round(delay / 1000)}s...`);
+    const delay = Math.min(3000 * Math.pow(1.5, this.reconnectAttempts), 20000);
+    console.log(`[WhatsApp] Reconnexion dans ${Math.round(delay / 1000)}s...`);
 
     this.reconnectTimeout = setTimeout(async () => {
-      this.sock = null;
+      await this.cleanupPreviousSocket();
       await this.start();
     }, delay);
   }
 
   public async stop(): Promise<void> {
-    if (this.reconnectTimeout) {
-      clearTimeout(this.reconnectTimeout);
-      this.reconnectTimeout = null;
-    }
-
-    if (this.sock) {
-      try {
-        this.sock.end(undefined);
-      } catch (e) {}
-      this.sock = null;
-    }
-
-    this.isConnecting = false;
+    await this.cleanupPreviousSocket();
     this.activePairingNumber = null;
-    console.log('[WhatsApp] Client WhatsApp arrêté.');
+    console.log('[WhatsApp] Client WhatsApp arrêté proprement.');
   }
 
   public async logout(): Promise<void> {
