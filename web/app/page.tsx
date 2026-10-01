@@ -61,8 +61,27 @@ export default function DashboardPage() {
           setLogs(logsData as BotLog[]);
         }
       } else {
-        // Mode invité / démo locale si non connecté
+        // Mode invité / démo locale si non connecté : interrogation directe de l'API bot
         setUser(null);
+        try {
+          const res = await fetch('/api/bot/status');
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.whatsapp) {
+              setConfig({
+                id: 'local',
+                user_id: 'local',
+                bot_status: 'running',
+                whatsapp_status: data.whatsapp.status || (data.whatsapp.isConnected ? 'connected' : 'disconnected'),
+                qr_code: data.whatsapp.qrCode || null,
+                whatsapp_user_jid: data.whatsapp.userJid || null,
+                destination_chat: null,
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              });
+            }
+          }
+        } catch {}
       }
     } catch (err) {
       console.error('Erreur chargement données :', err);
@@ -73,6 +92,32 @@ export default function DashboardPage() {
 
   useEffect(() => {
     loadData();
+
+    // Polling régulier de secours si non connecté
+    const pollInterval = setInterval(async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.user) {
+        try {
+          const res = await fetch('/api/bot/status');
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.whatsapp) {
+              setConfig((prev) => ({
+                id: prev?.id || 'local',
+                user_id: prev?.user_id || 'local',
+                bot_status: 'running',
+                whatsapp_status: data.whatsapp.status || (data.whatsapp.isConnected ? 'connected' : 'disconnected'),
+                qr_code: data.whatsapp.qrCode || null,
+                whatsapp_user_jid: data.whatsapp.userJid || null,
+                destination_chat: prev?.destination_chat || null,
+                created_at: prev?.created_at || new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+              }));
+            }
+          }
+        } catch {}
+      }
+    }, 2500);
 
     // 2. Écoute des mises à jour en temps réel (Supabase Realtime)
     const channel = supabase
@@ -98,6 +143,7 @@ export default function DashboardPage() {
       .subscribe();
 
     return () => {
+      clearInterval(pollInterval);
       supabase.removeChannel(channel);
     };
   }, [supabase, loadData]);

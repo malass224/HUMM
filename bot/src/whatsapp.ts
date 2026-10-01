@@ -37,6 +37,7 @@ export class WhatsAppManager {
   private maxReconnectAttempts: number = 10;
   private reconnectTimeout: NodeJS.Timeout | null = null;
   private activePairingNumber: string | null = null;
+  private lastQr: string | null = null;
 
   constructor() {
     this.ensureSessionDir();
@@ -66,6 +67,8 @@ export class WhatsAppManager {
       // 1. Présentation du QR code si pas en mode code de jumelage
       if (qr && !this.activePairingNumber) {
         console.log('[WhatsApp] Nouveau QR Code généré et prêt.');
+        this.lastQr = qr;
+        this.isConnecting = false;
         if (this.currentConfig) {
           await supabaseService.updateBotConfig(this.currentConfig.id, {
             whatsapp_status: 'qr_ready',
@@ -83,6 +86,7 @@ export class WhatsAppManager {
       if (connection === 'open') {
         console.log('[WhatsApp] Connexion WhatsApp établie avec succès !');
         this.isConnecting = false;
+        this.lastQr = null;
         this.reconnectAttempts = 0;
         this.activePairingNumber = null;
 
@@ -104,6 +108,7 @@ export class WhatsAppManager {
       // 3. Déconnexion ou coupure temporaire
       if (connection === 'close') {
         this.isConnecting = false;
+        this.lastQr = null;
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
@@ -178,7 +183,7 @@ export class WhatsAppManager {
         version,
         logger,
         printQRInTerminal: false,
-        browser: Browsers.macOS('Desktop'),
+        browser: Browsers.ubuntu('Chrome'),
         auth: {
           creds: state.creds,
           keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -230,7 +235,7 @@ export class WhatsAppManager {
       version,
       logger,
       printQRInTerminal: false,
-      browser: Browsers.macOS('Desktop'),
+      browser: Browsers.ubuntu('Chrome'),
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger),
@@ -315,8 +320,9 @@ export class WhatsAppManager {
       return;
     }
 
-    this.reconnectAttempts++;
-    const delay = Math.min(3000 * Math.pow(1.5, this.reconnectAttempts), 20000);
+    // En attente de scan QR, reconnexion rapide (2s) pour ne pas laisser un QR périmé à l'écran
+    const isUnregistered = !this.sock?.user;
+    const delay = isUnregistered ? 2000 : Math.min(3000 * Math.pow(1.5, this.reconnectAttempts), 20000);
     console.log(`[WhatsApp] Reconnexion dans ${Math.round(delay / 1000)}s...`);
 
     this.reconnectTimeout = setTimeout(async () => {
@@ -371,10 +377,14 @@ export class WhatsAppManager {
     }
   }
 
-  public getStatus(): { isConnected: boolean; isConnecting: boolean } {
+  public getStatus() {
     return {
       isConnected: this.sock?.user !== undefined,
       isConnecting: this.isConnecting,
+      status: this.sock?.user ? 'connected' : (this.lastQr ? 'qr_ready' : (this.currentConfig?.whatsapp_status || 'disconnected')),
+      qrCode: this.lastQr || this.currentConfig?.qr_code || null,
+      userJid: this.sock?.user?.id || null,
+      userName: this.sock?.user?.name || null,
     };
   }
 }
