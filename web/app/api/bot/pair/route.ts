@@ -11,7 +11,7 @@ export async function POST(req: Request) {
       );
     }
 
-    const botApiUrl = process.env.BOT_API_URL || 'http://localhost:3001';
+    const botApiUrl = process.env.BOT_API_URL || 'http://127.0.0.1:3001';
 
     const response = await fetch(`${botApiUrl}/api/pair`, {
       method: 'POST',
