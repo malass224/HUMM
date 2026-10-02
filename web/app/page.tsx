@@ -154,31 +154,12 @@ export default function DashboardPage() {
     const newStatus: BotStatus = botStatus === 'running' ? 'stopped' : 'running';
 
     try {
-      if (user && config) {
-        await supabase
-          .from('bot_config')
-          .update({
-            bot_status: newStatus,
-            whatsapp_status: newStatus === 'running' ? 'connecting' : config.whatsapp_status,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', config.id);
-
-        setConfig((prev) => prev ? { ...prev, bot_status: newStatus } : null);
-      } else {
-        // Simulation locale si non connecté à Supabase
-        setConfig((prev) => ({
-          id: 'demo-config',
-          user_id: 'demo-user',
-          bot_status: newStatus,
-          whatsapp_status: newStatus === 'running' ? 'qr_ready' : 'disconnected',
-          qr_code: newStatus === 'running' ? '2@HUMM_DEMO_QR_CODE_STRING_FOR_VERIFICATION' : null,
-          destination_chat: prev?.destination_chat || null,
-          whatsapp_user_jid: null,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        }));
-      }
+      await fetch('/api/bot/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: newStatus === 'running' ? 'start' : 'stop' }),
+      });
+      setConfig((prev) => prev ? { ...prev, bot_status: newStatus } : null);
     } catch (err) {
       console.error('Erreur bascule bot :', err);
     } finally {
@@ -190,17 +171,11 @@ export default function DashboardPage() {
   const handleDisconnect = async () => {
     setIsLoading(true);
     try {
-      if (user && config) {
-        await supabase
-          .from('bot_config')
-          .update({
-            whatsapp_status: 'disconnected',
-            qr_code: null,
-            whatsapp_user_jid: null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', config.id);
-      }
+      await fetch('/api/bot/status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'disconnect' }),
+      });
       setConfig((prev) => prev ? { ...prev, whatsapp_status: 'disconnected', qr_code: null, whatsapp_user_jid: null } : null);
     } catch (err) {
       console.error('Erreur déconnexion :', err);
@@ -212,19 +187,12 @@ export default function DashboardPage() {
   // Action : Sauvegarder le chat de destination
   const handleSaveDestination = async (destination: string): Promise<boolean> => {
     try {
-      if (user && config) {
-        const { error } = await supabase
-          .from('bot_config')
-          .update({
-            destination_chat: destination.trim() || null,
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', config.id);
-
-        if (error) throw error;
-        setConfig((prev) => prev ? { ...prev, destination_chat: destination } : null);
-        return true;
-      }
+      const res = await fetch('/api/bot/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ destination_chat: destination.trim() || null }),
+      });
+      if (!res.ok) throw new Error('Échec de la sauvegarde');
       setConfig((prev) => prev ? { ...prev, destination_chat: destination } : null);
       return true;
     } catch (err) {
